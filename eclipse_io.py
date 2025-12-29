@@ -121,46 +121,64 @@ def _build_file_index(work: Path) -> dict[str, Path]:
 def _extract_include_target(lines: list[str], i: int) -> tuple[str, int]:
     """
     Handles patterns:
+      INCLUDE 'file.INC' /
+      INCLUDE file.INC /
       INCLUDE
       'file.INC' /
-    or
-      INCLUDE 'file.INC' /
-    Returns (path_string, end_index_after_include_block)
+      file.INC /
+    Returns (include_path, next_index_after_include_block)
     """
-    # Case 1: path on same line as INCLUDE
-    s = strip_comments(lines[i])
+    # Line containing INCLUDE
+    s = strip_comments(lines[i]).strip()
+
+    # 1) Quoted path on same line
     m = re.search(r"'([^']+)'", s)
     if m:
         inc = m.group(1)
-        # advance until line containing '/'
         k = i
         while k < len(lines) and "/" not in lines[k]:
             k += 1
         return inc, k + 1
 
-    # Case 2: path on subsequent non-empty line(s)
+    # 2) Unquoted path on same line: INCLUDE something
+    toks = s.replace(",", " ").split()
+    if len(toks) >= 2 and toks[0].upper() == "INCLUDE":
+        inc = toks[1].strip().strip("'").strip('"')
+        inc = inc.replace("/", "").strip()
+        if inc and inc != "/":
+            k = i
+            while k < len(lines) and "/" not in lines[k]:
+                k += 1
+            return inc, k + 1
+
+    # 3) Path on later lines: skip blanks and standalone "/" lines
     j = i + 1
-    while j < len(lines) and not strip_comments(lines[j]):
-        j += 1
-    if j >= len(lines):
-        raise RuntimeError(f"INCLUDE without path near line {i}")
+    while j < len(lines):
+        sj = strip_comments(lines[j]).strip()
+        if not sj or sj == "/":
+            j += 1
+            continue
 
-    s2 = strip_comments(lines[j])
-    m2 = re.search(r"'([^']+)'", s2)
-    if m2:
-        inc = m2.group(1)
-    else:
-        toks = s2.split()
-        if not toks:
-            raise RuntimeError(f"INCLUDE without path near line {i}")
-        inc = toks[0]
+        # quoted on next lines
+        m2 = re.search(r"'([^']+)'", sj)
+        if m2:
+            inc = m2.group(1)
+        else:
+            # first token
+            inc = sj.split()[0].strip().strip("'").strip('"')
 
-    # skip until '/'
-    k = j
-    while k < len(lines) and "/" not in lines[k]:
-        k += 1
-    return inc, k + 1
+        inc = inc.replace("/", "").strip()
+        if not inc or inc == "/":
+            j += 1
+            continue
 
+        # advance until we pass the line containing '/'
+        k = j
+        while k < len(lines) and "/" not in lines[k]:
+            k += 1
+        return inc, k + 1
+
+    raise RuntimeError(f"INCLUDE without path near line {i}")
 
 def flatten_deck_with_includes(deck_path: Path, work_root: Path, file_index: dict[str, Path], max_depth: int = 40) -> list[str]:
     visited = set()
