@@ -1,283 +1,332 @@
-import sys
+import io
+import zipfile
 from pathlib import Path
 
-# app.py is in /mount/src/h2plume/app.py
-APP_DIR = Path(__file__).resolve().parent          # .../h2plume
-REPO_ROOT = APP_DIR.parent                         # .../
-
-for p in (APP_DIR, REPO_ROOT):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
-import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+from ve_core import (
+    DEFAULT_PARAMS,
+    prepare_phi_k,
+    choose_well_ij,
+    run_forward,
+    box_blur_nan_safe,
+)
 from eclipse_io import load_eclipse_phi_k_from_uploads
-from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
-from schedule_tools import build_cycle_schedule_ton_per_day, moving_average
 
 
-st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
-st.title("VE + Darcy + Land: Forward plume prediction (ton/day cyclic scheduling)")
+st.set_page_config(page_title="VE + Darcy + Land (Universal)", layout="wide")
+st.title("VE + Darcy + Land: Universal forward plume predictor")
 
 st.markdown(
     """
-This app runs a forward plume predictor from **phi/k** and an **injection schedule**.
+Run a **paper-style VE + Darcy + Land** forward model with either:
 
-**Inputs supported**
-- **NPZ**: keys `phi` and `k` (2D arrays)
-- **Eclipse TEXT deck**: upload main `.DATA` and also upload **all INCLUDE files** (`.INC/.GRDECL`) via the second uploader.
+**A) NPZ input** (`phi`, `k` arrays), or  
+**B) Eclipse input** (`.DATA` + INCLUDE files or `.GRDECL/.INC` zipped).
 
-**Schedules**
-- Upload CSV with `t,q`, or
-- Build an easy **ton/day cycle schedule** inside the app and export it.
+You can either upload a **schedule CSV**, or **build a schedule** from:
+- injection rate (**ton/day**),
+- cycle definition (inject/soak/produce/soak),
+- number of cycles and timestep (days).
+
+The app includes:
+- mask/phi/k quicklook,
+- debug checks (pressure != saturation),
+- optional *display-only smoothing*.
 """
 )
 
-# -------------------------
+# -----------------------------
 # plotting helpers
-# -------------------------
-def fig_imshow(arr, title, vmin=None, vmax=None):
-    fig = plt.figure(figsize=(7.2, 4.6))
+# -----------------------------
+def fig_imshow(arr, title, vmin=None, vmax=None, cmap=None):
+    fig = plt.figure(figsize=(7.2, 4.4))
     plt.title(title)
-    if vmin is None: vmin = float(np.nanmin(arr))
-    if vmax is None: vmax = float(np.nanmax(arr))
-    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax)
+    if vmin is None:
+        vmin = float(np.nanpercentile(arr, 1)) if np.isfinite(arr).any() else 0.0
+    if vmax is None:
+        vmax = float(np.nanpercentile(arr, 99)) if np.isfinite(arr).any() else 1.0
+    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap)
     plt.xlabel("j")
     plt.ylabel("i")
     plt.colorbar(im, fraction=0.046, pad=0.04)
     plt.tight_layout()
     return fig
 
-def fig_schedule(t, q, tidx=None):
-    fig = plt.figure(figsize=(7.2, 4.6))
-    plt.title("Schedule q(t)")
-    plt.plot(t, q)
-    if tidx is not None and 0 <= tidx < len(t):
-        plt.axvline(t[tidx], linestyle="--")
-    plt.xlabel("t (days or step)")
-    plt.ylabel("q (ton/day)")
-    plt.grid(True, alpha=0.3)
+def fig_schedule(t_days, q_ton_day, tidx=None):
+    fig = plt.figure(figsize=(7.2, 4.4))
+    plt.title("Schedule (ton/day)")
+    plt.plot(t_days, q_ton_day, linewidth=2)
+    if tidx is not None and 0 <= tidx < len(t_days):
+        plt.axvline(t_days[tidx], linestyle="--")
+    plt.xlabel("time (days)")
+    plt.ylabel("rate (ton/day), +inj / -prod")
+    plt.grid(True, alpha=0.25)
     plt.tight_layout()
     return fig
 
-def fig_timeseries(t, y, ylab, title):
-    fig = plt.figure(figsize=(7.2, 4.6))
+def fig_timeseries(t_days, y, ylab, title):
+    fig = plt.figure(figsize=(7.2, 4.4))
     plt.title(title)
-    plt.plot(t, y)
-    plt.xlabel("t")
+    plt.plot(t_days, y, linewidth=2)
+    plt.xlabel("time (days)")
     plt.ylabel(ylab)
-    plt.grid(True, alpha=0.3)
+    plt.grid(True, alpha=0.25)
     plt.tight_layout()
     return fig
 
-def load_npz(uploaded):
-    data = np.load(uploaded)
-    if "phi" not in data or "k" not in data:
-        raise ValueError("NPZ must contain keys: phi and k")
-    meta = {}
-    for key in data.files:
-        if key not in ("phi", "k"):
-            try:
-                meta[key] = data[key]
-            except Exception:
-                pass
-    return data["phi"], data["k"], meta
+# -----------------------------
+# schedule builder
+# -----------------------------
+def build_cycle_schedule_ton_day(
+    dt_days: float,
+    n_cycles: int,
+    inj_days: float,
+    soak1_days: float,
+    prod_days: float,
+    soak2_days: float,
+    inj_rate_ton_day: float,
+    prod_rate_ton_day: float,
+):
+    """
+    Returns (t_days, q_ton_day) sampled every dt_days.
+    Pattern per cycle: +inj -> 0 -> -prod -> 0
+    """
+    dt_days = float(dt_days)
+    assert dt_days > 0
+
+    phases = [
+        (inj_days, +abs(inj_rate_ton_day)),
+        (soak1_days, 0.0),
+        (prod_days, -abs(prod_rate_ton_day)),
+        (soak2_days, 0.0),
+    ]
+
+    t_list = []
+    q_list = []
+    t = 0.0
+
+    for _ in range(int(n_cycles)):
+        for dur, rate in phases:
+            dur = float(dur)
+            if dur <= 0:
+                continue
+            n = int(np.round(dur / dt_days))
+            n = max(n, 1)
+            for _k in range(n):
+                t_list.append(t)
+                q_list.append(rate)
+                t += dt_days
+
+    # include last time
+    t_list.append(t)
+    q_list.append(0.0)
+
+    return np.asarray(t_list, dtype=np.float32), np.asarray(q_list, dtype=np.float32)
 
 def load_schedule_csv(uploaded):
     df = pd.read_csv(uploaded)
     df.columns = [c.lower().strip() for c in df.columns]
     if "t" not in df.columns or "q" not in df.columns:
-        raise ValueError("CSV must have columns: t, q")
-    return df[["t", "q"]].copy()
+        raise ValueError("CSV must have columns: t, q (t in days, q in ton/day).")
+    t = df["t"].to_numpy(dtype=np.float32)
+    q = df["q"].to_numpy(dtype=np.float32)
+    return t, q
 
-# -------------------------
+def load_npz(uploaded):
+    data = np.load(uploaded)
+    if "phi" not in data or "k" not in data:
+        raise ValueError("NPZ must contain keys: phi and k")
+    phi = np.asarray(data["phi"], dtype=np.float32)
+    k = np.asarray(data["k"], dtype=np.float32)
+    return phi, k
+
+# -----------------------------
 # Sidebar
-# -------------------------
+# -----------------------------
 with st.sidebar:
-    st.header("1) Inputs")
-
-    input_type = st.radio("phi/k source", ["NPZ (phi,k)", "Eclipse TEXT deck (.DATA + includes)"], index=0)
-
-    if input_type.startswith("NPZ"):
-        up_npz = st.file_uploader("Upload NPZ", type=["npz"])
-        up_deck = None
-        up_includes = []
-    else:
-        up_deck = st.file_uploader("Upload main deck (.DATA)", type=["data", "DATA"])
-        up_includes = st.file_uploader("Upload INCLUDE files (.INC/.GRDECL) (multi)", accept_multiple_files=True)
-        up_npz = None
-
-        st.divider()
-        st.subheader("Eclipse conversion")
-        ecl_mode = st.selectbox("Convert 3D -> 2D", ["layer", "mean"], index=0)
-        ecl_layer = st.number_input("Layer index (if layer)", value=0, step=1)
-        ecl_kkey = st.text_input("Permeability keyword", value="PERMX")
+    st.header("1) Choose input type")
+    input_mode = st.selectbox("Input", ["NPZ (phi/k)", "Eclipse deck / GRDECL (zip)"], index=0)
 
     st.divider()
-    st.header("2) Schedule")
-
-    sched_mode = st.radio("Schedule input", ["Upload CSV (t,q)", "Build cyclic ton/day schedule"], index=1)
-
-    up_csv = None
-    schedule_df = None
-
-    if sched_mode.startswith("Upload"):
-        up_csv = st.file_uploader("Upload schedule CSV", type=["csv"])
+    st.header("2) Upload")
+    up_npz = None
+    up_zip = None
+    if input_mode == "NPZ (phi/k)":
+        up_npz = st.file_uploader("Upload NPZ with keys phi,k", type=["npz"])
     else:
-        st.subheader("Cycle settings (ton/day)")
-        total_days = st.number_input("Total duration (days)", value=2000.0)
-        dt_days = st.number_input("dt (days per step)", value=10.0)
-        cycle_days = st.number_input("Cycle length (days)", value=365.0)
-
-        inj_days = st.number_input("Injection duration in cycle (days)", value=180.0)
-        shut_days = st.number_input("Shut-in duration in cycle (days)", value=5.0)
-        prod_days = st.number_input("Production duration in cycle (days)", value=180.0)
-
-        Qinj = st.number_input("Injection rate Qinj (ton/day)", value=1000.0)
-        Qprod = st.number_input("Production rate Qprod (ton/day)", value=800.0)
-
-        ramp_days = st.number_input("Ramp smoothing (days)", value=20.0)
-        ma_window = st.number_input("Optional moving-average window (timesteps)", value=1, step=1)
-
-        build_btn = st.button("Build schedule", type="secondary")
-
-        if build_btn:
-            df = build_cycle_schedule_ton_per_day(
-                total_days=float(total_days),
-                dt_days=float(dt_days),
-                cycle_days=float(cycle_days),
-                inj_days=float(inj_days),
-                shut_days=float(shut_days),
-                prod_days=float(prod_days),
-                Qinj_tpd=float(Qinj),
-                Qprod_tpd=float(Qprod),
-                ramp_days=float(ramp_days),
-                start_day=0.0,
-            )
-            if int(ma_window) > 1:
-                df["q"] = moving_average(df["q"].to_numpy(np.float32), int(ma_window))
-            st.session_state["schedule_df"] = df
-
-        schedule_df = st.session_state.get("schedule_df", None)
-
-        if schedule_df is not None:
-            # export buttons
-            csv_bytes = schedule_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download schedule CSV", data=csv_bytes, file_name="schedule_cycle_ton_per_day.csv")
-
-            out_xlsx = io.BytesIO()
-            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
-                schedule_df.to_excel(w, index=False, sheet_name="schedule")
-            st.download_button("Download schedule Excel", data=out_xlsx.getvalue(), file_name="schedule_cycle_ton_per_day.xlsx")
+        up_zip = st.file_uploader(
+            "Upload a ZIP containing .DATA and includes (or GRDECL/INC)",
+            type=["zip"],
+        )
 
     st.divider()
-    st.header("3) Well + params")
+    st.header("3) Schedule")
+    sched_mode = st.selectbox("Schedule mode", ["Build cycles (ton/day)", "Upload CSV (t,q)"], index=0)
+
+    if sched_mode == "Upload CSV (t,q)":
+        up_csv = st.file_uploader("Upload schedule CSV with columns t,q (days, ton/day)", type=["csv"])
+    else:
+        dt_days = st.number_input("dt (days)", value=5.0, min_value=0.1, step=0.5)
+        n_cycles = st.number_input("number of cycles", value=3, min_value=1, step=1)
+
+        inj_days = st.number_input("inject days (per cycle)", value=90.0, min_value=1.0, step=5.0)
+        soak1_days = st.number_input("soak days after injection", value=30.0, min_value=0.0, step=5.0)
+        prod_days = st.number_input("produce days (per cycle)", value=60.0, min_value=0.0, step=5.0)
+        soak2_days = st.number_input("soak days after production", value=30.0, min_value=0.0, step=5.0)
+
+        inj_rate = st.number_input("injection rate (ton/day)", value=1000.0, min_value=0.0, step=100.0)
+        prod_rate = st.number_input("production rate (ton/day)", value=700.0, min_value=0.0, step=100.0)
+
+    st.divider()
+    st.header("4) Well placement")
     well_mode = st.selectbox("Well placement", ["max_k", "center", "manual"], index=0)
     manual_i = st.number_input("manual i", value=0, step=1)
     manual_j = st.number_input("manual j", value=0, step=1)
 
-    thr_area = st.slider("Area threshold (Sg > thr)", 0.0, 0.5, 0.05, 0.01)
+    st.divider()
+    st.header("5) Model scaling")
+    normalize_q = st.checkbox("Normalize schedule to max(|q|)=1 (recommended)", value=True)
+    q_scale = st.number_input("Extra q scale factor", value=1.0, step=0.1)
 
-    st.subheader("Model parameters")
+    st.divider()
+    st.header("6) Display")
+    show_mask = st.checkbox("Show active mask", value=True)
+    smooth_display = st.checkbox("Smooth display (visual only)", value=True)
+    smooth_radius = st.slider("Smoothing radius", 0, 5, 2, 1)
+
+    st.divider()
+    st.header("7) Parameters (paper-ish defaults)")
+    use_defaults = st.checkbox("Use DEFAULT_PARAMS", value=True)
     params = dict(DEFAULT_PARAMS)
-    show_params = st.checkbox("Edit parameters", value=False)
-    if show_params:
-        for k in list(params.keys()):
-            params[k] = st.number_input(k, value=float(params[k]))
+    if not use_defaults:
+        # expose a small set that matters most
+        params["D0"] = float(st.number_input("D0 (diffusion base)", value=float(params["D0"]), step=0.05))
+        params["src_amp"] = float(st.number_input("src_amp (source strength)", value=float(params["src_amp"]), step=0.05))
+        params["anisD"] = float(st.number_input("anisD (anisotropy)", value=float(params["anisD"]), step=0.1))
+        params["mob_exp"] = float(st.number_input("mob_exp (mobility exponent)", value=float(params["mob_exp"]), step=0.25))
+        params["C_L"] = float(st.number_input("C_L (Land coeff)", value=float(params["C_L"]), step=0.05))
+        params["Sgr_max"] = float(st.number_input("Sgr_max", value=float(params["Sgr_max"]), step=0.02))
+        params["prod_frac"] = float(st.number_input("prod_frac (production removes mobile gas)", value=float(params["prod_frac"]), step=0.05))
 
+    st.divider()
+    thr_area = st.slider("Area threshold (Sg > thr)", 0.0, 0.5, 0.05, 0.01)
     run_btn = st.button("Run forward prediction", type="primary")
 
-# -------------------------
-# Load phi/k
-# -------------------------
-try:
-    if input_type.startswith("NPZ"):
-        if up_npz is None:
-            st.info("Upload NPZ to begin.")
-            st.stop()
-        phi, k, meta = load_npz(up_npz)
-        src_note = "NPZ"
-    else:
-        if up_deck is None:
-            st.info("Upload .DATA deck to begin.")
-            st.stop()
-        phi, k, meta = load_eclipse_phi_k_from_uploads(
-            up_deck,
-            up_includes or [],
-            kkey=ecl_kkey,
-            mode=ecl_mode,
-            layer=int(ecl_layer),
-        )
-        src_note = f"Eclipse: {meta.get('deck','deck')}"
-except Exception as e:
-    st.error(f"Failed to read inputs: {e}")
-    st.stop()
 
-# -------------------------
-# Load schedule
-# -------------------------
-try:
-    if sched_mode.startswith("Upload"):
-        if up_csv is None:
-            st.info("Upload schedule CSV (t,q), or switch to schedule builder.")
-            st.stop()
-        schedule_df = load_schedule_csv(up_csv)
-    else:
-        if schedule_df is None:
-            st.info("Click **Build schedule** in the sidebar.")
-            st.stop()
+# -----------------------------
+# Load inputs
+# -----------------------------
+phi = k = None
 
-    t = schedule_df["t"].to_numpy(dtype=np.float32)
-    q = schedule_df["q"].to_numpy(dtype=np.float32)
-except Exception as e:
-    st.error(f"Failed to read schedule: {e}")
-    st.stop()
+if input_mode == "NPZ (phi/k)":
+    if up_npz is None:
+        st.info("Upload an NPZ to start.")
+        st.stop()
+    try:
+        phi, k = load_npz(up_npz)
+    except Exception as e:
+        st.error(f"Failed to read NPZ: {e}")
+        st.stop()
+else:
+    if up_zip is None:
+        st.info("Upload a ZIP with Eclipse files to start.")
+        st.stop()
+    try:
+        phi, k = load_eclipse_phi_k_from_uploads(up_zip)
+    except Exception as e:
+        st.error(f"Failed to read Eclipse files: {e}")
+        st.stop()
 
-st.caption(f"Loaded {src_note} | phi/k shape={phi.shape} | schedule steps={len(t)}")
+# schedule
+if sched_mode == "Upload CSV (t,q)":
+    if up_csv is None:
+        st.info("Upload a schedule CSV to run.")
+        st.stop()
+    try:
+        t_days, q_ton_day = load_schedule_csv(up_csv)
+    except Exception as e:
+        st.error(f"Failed to read schedule CSV: {e}")
+        st.stop()
+else:
+    t_days, q_ton_day = build_cycle_schedule_ton_day(
+        dt_days=dt_days,
+        n_cycles=n_cycles,
+        inj_days=inj_days,
+        soak1_days=soak1_days,
+        prod_days=prod_days,
+        soak2_days=soak2_days,
+        inj_rate_ton_day=inj_rate,
+        prod_rate_ton_day=prod_rate,
+    )
 
-# previews
+# normalize + scale
+q = q_ton_day.astype(np.float32) * np.float32(q_scale)
+if normalize_q:
+    m = float(np.max(np.abs(q))) if q.size else 1.0
+    if m > 0:
+        q = (q / m).astype(np.float32)
+
+# -----------------------------
+# Quicklook inputs
+# -----------------------------
 colA, colB = st.columns(2)
 with colA:
-    st.subheader("Porosity (phi)")
-    st.pyplot(fig_imshow(phi, f"phi | shape={phi.shape}"))
+    st.subheader("phi")
+    st.pyplot(fig_imshow(phi, f"phi | shape={phi.shape}", vmin=None, vmax=None))
 with colB:
-    st.subheader("Permeability (k)")
-    st.pyplot(fig_imshow(k, f"k | shape={k.shape}"))
+    st.subheader("k")
+    st.pyplot(fig_imshow(k, f"k | shape={k.shape}", vmin=None, vmax=None))
 
-st.subheader("Schedule (ton/day)")
-st.pyplot(fig_schedule(t, q, tidx=0))
-
-# well selection preview
+# prep + mask
 try:
-    _, k_norm, mask = prepare_phi_k(phi, k)
-    if well_mode == "manual":
-        well_ij = (int(manual_i), int(manual_j))
-    else:
-        well_ij = None
-    wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
-    st.caption(f"Selected well (i,j)=({wi},{wj}) | active cells={int(mask.sum())}")
+    phi2, k_norm, mask = prepare_phi_k(phi, k)
 except Exception as e:
-    st.error(f"Input fields invalid: {e}")
+    st.error(f"Invalid phi/k fields: {e}")
     st.stop()
+
+if show_mask:
+    st.subheader("Active mask (1=active)")
+    st.pyplot(fig_imshow(mask.astype(np.float32), "mask", vmin=0.0, vmax=1.0))
+
+# choose well
+if well_mode == "manual":
+    well_ij = (int(manual_i), int(manual_j))
+else:
+    well_ij = None
+wi, wj = choose_well_ij(k_norm, mask, well_mode=well_mode, ij=well_ij)
+st.caption(f"Selected well (i,j)=({wi},{wj}) | active={int(mask.sum())}")
+
+# show schedule
+st.subheader("Schedule")
+st.pyplot(fig_schedule(t_days, q_ton_day, tidx=0))
+
+# download the built schedule if in builder mode
+if sched_mode == "Build cycles (ton/day)":
+    st.download_button(
+        "Download this schedule (CSV)",
+        data=pd.DataFrame({"t": t_days, "q": q_ton_day}).to_csv(index=False).encode("utf-8"),
+        file_name="schedule_cycles_ton_day.csv",
+    )
 
 if not run_btn:
     st.stop()
 
-# run model
-with st.spinner("Running forward model..."):
+# -----------------------------
+# Run model
+# -----------------------------
+with st.spinner("Running VE + Darcy + Land forward model..."):
     try:
         res = run_forward(
-            phi=phi,
+            phi=phi2,
             k=k,
-            t=t,
-            q=q,
+            t_days=t_days,
+            q_norm=q,                 # normalized schedule used for model source term
             params=params,
-            well_mode=well_mode,
-            well_ij=(int(manual_i), int(manual_j)) if well_mode == "manual" else None,
+            well_ij=(wi, wj),
             return_pressure=True,
             thr_area=float(thr_area),
         )
@@ -287,37 +336,73 @@ with st.spinner("Running forward model..."):
 
 st.success("Done.")
 
-Nt = len(res.sg_list)
-tidx = st.slider("Select timestep", 0, max(0, Nt - 1), min(0, Nt - 1))
+Nt = len(res["sg_list"])
+tidx = st.slider("Select timestep (tidx)", 0, max(0, Nt - 1), 0)
+
+sg = res["sg_list"][tidx]
+p = res["p_list"][tidx] if res["p_list"] is not None else None
+
+# optional display smoothing (visual only)
+sg_show = box_blur_nan_safe(sg, smooth_radius) if smooth_display else sg
+p_show = box_blur_nan_safe(p, smooth_radius) if (smooth_display and p is not None) else p
 
 left, right = st.columns(2)
 with left:
     st.subheader(f"Sg predicted | tidx={tidx}")
-    st.pyplot(fig_imshow(res.sg_list[tidx], f"Sg | tidx={tidx}", vmin=0.0, vmax=1.0))
+    st.pyplot(fig_imshow(sg_show, f"Sg | tidx={tidx}", vmin=0.0, vmax=1.0))
 with right:
     st.subheader(f"Pressure surrogate | tidx={tidx}")
-    if res.p_list is None:
-        st.write("Pressure disabled.")
+    if p_show is None:
+        st.write("Pressure output disabled.")
     else:
-        st.pyplot(fig_imshow(res.p_list[tidx], f"p | tidx={tidx}"))
+        # percentile scaling avoids “all purple”
+        vmin = float(np.nanpercentile(p_show, 1))
+        vmax = float(np.nanpercentile(p_show, 99))
+        st.pyplot(fig_imshow(p_show, f"p | tidx={tidx}", vmin=vmin, vmax=vmax))
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.subheader("q(t)")
-    st.pyplot(fig_schedule(res.t, res.q, tidx=tidx))
+    st.subheader("q(t) (ton/day)")
+    st.pyplot(fig_schedule(res["t_days"], res["q_ton_day"], tidx=tidx))
 with col2:
     st.subheader("Plume area")
-    st.pyplot(fig_timeseries(res.t, res.area, "area (cells)", "Area time series"))
+    st.pyplot(fig_timeseries(res["t_days"], res["area"], "area (cells)", "Area time series"))
 with col3:
     st.subheader("Equivalent radius")
-    st.pyplot(fig_timeseries(res.t, res.r_eq, "r_eq (cells)", "Equivalent radius time series"))
+    st.pyplot(fig_timeseries(res["t_days"], res["r_eq"], "r_eq (cells)", "Equivalent radius time series"))
 
-# downloads
+# -----------------------------
+# Debug panel
+# -----------------------------
+with st.expander("Debug (pressure != saturation)"):
+    st.write("Sg stats:", float(np.nanmin(sg)), float(np.nanmax(sg)), float(np.nanmean(np.nan_to_num(sg))))
+    if p is None:
+        st.write("Pressure: None")
+    else:
+        st.write("P stats:", float(np.nanmin(p)), float(np.nanmax(p)), float(np.nanmean(np.nan_to_num(p))))
+        st.write("allclose(Sg,P):", bool(np.allclose(np.nan_to_num(sg), np.nan_to_num(p))))
+        st.write("same object id:", (id(sg) == id(p)))
+
+# -----------------------------
+# Download results
+# -----------------------------
 st.subheader("Download results")
-out_npz = io.BytesIO()
-sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res.sg_list], axis=0).astype(np.float32)
-np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq)
-st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_name="sg_predicted.npz")
 
-out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
+out_npz = io.BytesIO()
+sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res["sg_list"]], axis=0).astype(np.float32)
+p_stack = None if res["p_list"] is None else np.stack([np.nan_to_num(x, nan=0.0) for x in res["p_list"]], axis=0).astype(np.float32)
+np.savez_compressed(
+    out_npz,
+    sg=sg_stack,
+    p=p_stack if p_stack is not None else np.array([], dtype=np.float32),
+    t_days=res["t_days"],
+    q_ton_day=res["q_ton_day"],
+    area=res["area"],
+    r_eq=res["r_eq"],
+)
+st.download_button("Download predicted fields (NPZ)", data=out_npz.getvalue(), file_name="ve_results.npz")
+
+out_csv = pd.DataFrame(
+    {"t_days": res["t_days"], "q_ton_day": res["q_ton_day"], "area": res["area"], "r_eq": res["r_eq"]}
+).to_csv(index=False).encode("utf-8")
 st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
