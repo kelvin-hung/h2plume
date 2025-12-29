@@ -1,43 +1,38 @@
-# eclipse_io.py
-from __future__ import annotations
-
+import io
 import re
-import tempfile
+import zipfile
 from pathlib import Path
+
 import numpy as np
 
-_TMPDIR_HOLD = []
 
-
-def strip_comments(line: str) -> str:
+def _strip_comments(line: str) -> str:
+    # Eclipse sometimes uses -- comments; also support # for robustness
     line = line.split("--", 1)[0]
     line = line.split("#", 1)[0]
-    return line.strip()
+    return line.rstrip("\n")
 
 
-def parse_repeat_token(tok: str) -> list[float]:
-    tok = tok.strip()
-    if not tok:
-        return []
+def _parse_repeat_token(tok: str):
+    # Eclipse repeat notation: 10*0.25
     m = re.match(r"^(\d+)\*(.+)$", tok)
     if m:
         n = int(m.group(1))
-        try:
-            v = float(m.group(2))
-        except Exception:
-            return []
+        v = float(m.group(2))
         return [v] * n
-    try:
-        return [float(tok)]
-    except Exception:
-        return []
+    return [float(tok)]
 
 
-def parse_numeric_block(lines: list[str], start_idx: int) -> tuple[np.ndarray, int]:
-    vals: list[float] = []
+def _parse_numeric_block(lines, start_idx):
+    """
+    Parse numbers from lines starting at start_idx until encountering a '/'.
+    Supports repeat notation.
+    Returns (values_array, end_idx_inclusive)
+    """
+    vals = []
     i = start_idx
     while i < len(lines):
-        s = strip_comments(lines[i])
+        s = _strip_comments(lines[i]).strip()
         if not s:
             i += 1
             continue
@@ -46,234 +41,209 @@ def parse_numeric_block(lines: list[str], start_idx: int) -> tuple[np.ndarray, i
             head = s.split("/", 1)[0].strip()
             if head:
                 for tok in head.replace(",", " ").split():
-                    vals.extend(parse_repeat_token(tok))
+                    vals.extend(_parse_repeat_token(tok))
             return np.array(vals, dtype=np.float32), i
 
         for tok in s.replace(",", " ").split():
-            vals.extend(parse_repeat_token(tok))
+            # ignore non-numeric stray tokens safely
+            try:
+                vals.extend(_parse_repeat_token(tok))
+            except Exception:
+                pass
+
         i += 1
 
     raise RuntimeError("Numeric block did not terminate with '/'")
 
 
-def find_keyword(lines: list[str], keyword: str) -> int | None:
+def _find_keyword(lines, keyword: str):
     kw = keyword.upper()
     for i, raw in enumerate(lines):
-        if strip_comments(raw).upper() == kw:
+        if _strip_comments(raw).strip().upper() == kw:
             return i
     return None
 
 
-def read_keyword_array(lines: list[str], keyword: str) -> np.ndarray | None:
-    idx = find_keyword(lines, keyword)
+def _read_specgrid_or_dimens(lines):
+    idx = _find_keyword(lines, "SPECGRID")
+    if idx is None:
+        idx = _find_keyword(lines, "DIMENS")
+    if idx is None:
+        raise RuntimeError("Could not find SPECGRID or DIMENS.")
+    block, _ = _parse_numeric_block(lines, idx + 1)
+    if block.size < 3:
+        raise RuntimeError("SPECGRID/DIMENS has <3 numbers.")
+    nx, ny, nz = int(block[0]), int(block[1]), int(block[2])
+    return nx, ny, nz
+
+
+def _read_keyword_array(lines, keyword: str):
+    idx = _find_keyword(lines, keyword)
     if idx is None:
         return None
-    arr, _ = parse_numeric_block(lines, idx + 1)
+    arr, _ = _parse_numeric_block(lines, idx + 1)
     return arr
 
 
-def read_specgrid(lines: list[str]) -> tuple[int, int, int]:
-    idx = find_keyword(lines, "SPECGRID")
-    if idx is None:
-        idx = find_keyword(lines, "DIMENS")
-    if idx is None:
-        raise RuntimeError("Could not find SPECGRID or DIMENS.")
-    block, _ = parse_numeric_block(lines, idx + 1)
-    if block.size < 3:
-        raise RuntimeError("SPECGRID/DIMENS has <3 numeric values.")
-    return int(block[0]), int(block[1]), int(block[2])
-
-
-def to_2d(arr3d: np.ndarray, nx: int, ny: int, nz: int, mode: str, layer: int) -> np.ndarray:
-    a = arr3d.reshape((nz, ny, nx))      # (K, J, I)
-    a = np.transpose(a, (2, 1, 0))       # -> (I, J, K)
-    if mode == "layer":
-        k = int(np.clip(layer, 0, nz - 1))
-        return a[:, :, k]
-    if mode == "mean":
-        return np.nanmean(a, axis=2)
-    raise ValueError("mode must be 'layer' or 'mean'")
-
-
-def _write_upload(work: Path, uploaded) -> Path:
-    # Preserve subfolders if present in name
-    name = uploaded.name or "uploaded.inc"
-    p = work / name
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(uploaded.getvalue())
-    return p
-
-
-def _build_file_index(work: Path) -> dict[str, Path]:
-    """
-    Map lowercase basename -> path, and also lowercase full relative path -> path.
-    Helps resolve INCLUDE 'folder/file.INC' even if uploaded flat.
-    """
-    idx: dict[str, Path] = {}
-    for p in work.rglob("*"):
-        if p.is_file():
-            rel = str(p.relative_to(work)).replace("\\", "/").lower()
-            idx[rel] = p
-            idx[p.name.lower()] = p
-    return idx
-
-
-def _extract_include_target(lines: list[str], i: int) -> tuple[str, int]:
-    """
-    Handles patterns:
-      INCLUDE 'file.INC' /
-      INCLUDE file.INC /
-      INCLUDE
-      'file.INC' /
-      file.INC /
-    Returns (include_path, next_index_after_include_block)
-    """
-    # Line containing INCLUDE
-    s = strip_comments(lines[i]).strip()
-
-    # 1) Quoted path on same line
+def _read_include_path_from_line(line: str):
+    s = _strip_comments(line).strip()
+    if not s:
+        return None
+    # quoted path
     m = re.search(r"'([^']+)'", s)
     if m:
-        inc = m.group(1)
-        k = i
-        while k < len(lines) and "/" not in lines[k]:
-            k += 1
-        return inc, k + 1
-
-    # 2) Unquoted path on same line: INCLUDE something
+        return m.group(1)
+    # otherwise token
     toks = s.replace(",", " ").split()
-    if len(toks) >= 2 and toks[0].upper() == "INCLUDE":
-        inc = toks[1].strip().strip("'").strip('"')
-        inc = inc.replace("/", "").strip()
-        if inc and inc != "/":
-            k = i
-            while k < len(lines) and "/" not in lines[k]:
-                k += 1
-            return inc, k + 1
+    if not toks:
+        return None
+    # allow: FILE.INC /
+    if toks[0].upper() == "INCLUDE" and len(toks) > 1:
+        return toks[1]
+    return toks[0]
 
-    # 3) Path on later lines: skip blanks and standalone "/" lines
-    j = i + 1
-    while j < len(lines):
-        sj = strip_comments(lines[j]).strip()
-        if not sj or sj == "/":
-            j += 1
-            continue
 
-        # quoted on next lines
-        m2 = re.search(r"'([^']+)'", sj)
-        if m2:
-            inc = m2.group(1)
-        else:
-            # first token
-            inc = sj.split()[0].strip().strip("'").strip('"')
+def _flatten_deck_lines_from_zip(zip_bytes: bytes, entry_name_hint: str = None, max_depth=50):
+    """
+    Read a ZIP containing Eclipse deck and INCLUDEs.
+    Returns flattened lines for the main .DATA file.
+    """
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    names = zf.namelist()
 
-        inc = inc.replace("/", "").strip()
-        if not inc or inc == "/":
-            j += 1
-            continue
+    # choose entry .DATA
+    data_candidates = [n for n in names if n.upper().endswith(".DATA")]
+    if not data_candidates:
+        raise RuntimeError("ZIP does not contain a .DATA file.")
+    if entry_name_hint and entry_name_hint in names:
+        entry = entry_name_hint
+    else:
+        # prefer shortest path name
+        entry = sorted(data_candidates, key=lambda s: (s.count("/"), len(s)))[0]
 
-        # advance until we pass the line containing '/'
-        k = j
-        while k < len(lines) and "/" not in lines[k]:
-            k += 1
-        return inc, k + 1
-
-    raise RuntimeError(f"INCLUDE without path near line {i}")
-
-def flatten_deck_with_includes(deck_path: Path, work_root: Path, file_index: dict[str, Path], max_depth: int = 40) -> list[str]:
     visited = set()
 
-    def _resolve_include(cur_file: Path, inc: str) -> Path:
-        # try relative to current file
-        p1 = (cur_file.parent / inc).resolve()
-        if p1.exists():
-            return p1
-        # try by relative path key in index
-        key_rel = inc.replace("\\", "/").lstrip("/").lower()
-        if key_rel in file_index:
-            return file_index[key_rel]
-        # try basename
-        base = Path(inc).name.lower()
-        if base in file_index:
-            return file_index[base]
-        raise RuntimeError(f"Missing INCLUDE file: {inc}")
+    def read_text(name):
+        return zf.read(name).decode("utf-8", errors="ignore").splitlines()
 
-    def _flatten(p: Path, depth: int) -> list[str]:
+    def resolve_rel(base_name, rel):
+        # Eclipse INCLUDE paths often relative to deck folder
+        base_dir = "/".join(base_name.split("/")[:-1])
+        candidate = f"{base_dir}/{rel}" if base_dir else rel
+        # normalize simplistic
+        candidate = candidate.replace("//", "/")
+        if candidate in names:
+            return candidate
+        # fallback: search by basename
+        b = rel.split("/")[-1]
+        hits = [n for n in names if n.split("/")[-1].lower() == b.lower()]
+        return hits[0] if hits else None
+
+    def flatten(name, depth=0):
         if depth > max_depth:
             raise RuntimeError("Too deep INCLUDE nesting (possible loop).")
-        p = p.resolve()
-        key = str(p)
-        if key in visited:
+        if name in visited:
             return []
-        visited.add(key)
+        visited.add(name)
 
-        txt = p.read_text(errors="ignore")
-        lines = txt.splitlines()
-        out: list[str] = []
+        lines = read_text(name)
+        out = []
         i = 0
         while i < len(lines):
-            s_upper = strip_comments(lines[i]).upper()
-            if s_upper.startswith("INCLUDE"):
-                inc, next_i = _extract_include_target(lines, i)
-                inc_path = _resolve_include(p, inc)
-                out.extend(_flatten(inc_path, depth + 1))
-                i = next_i
+            s = _strip_comments(lines[i]).strip()
+            if s.upper() == "INCLUDE":
+                # look ahead for the include path line
+                j = i + 1
+                while j < len(lines) and _strip_comments(lines[j]).strip() == "":
+                    j += 1
+
+                # Sometimes decks have INCLUDE then "/" then file; handle that:
+                if j < len(lines) and _strip_comments(lines[j]).strip() == "/":
+                    j += 1
+                    while j < len(lines) and _strip_comments(lines[j]).strip() == "":
+                        j += 1
+
+                if j >= len(lines):
+                    raise RuntimeError(f"INCLUDE without a following path near line {i} in {name}")
+
+                inc_line = _strip_comments(lines[j]).strip()
+                inc_rel = _read_include_path_from_line(inc_line)
+                if inc_rel is None:
+                    raise RuntimeError(f"INCLUDE without path near line {i} in {name}")
+
+                inc_name = resolve_rel(name, inc_rel)
+                if inc_name is None:
+                    raise RuntimeError(f"INCLUDE file not found in ZIP: {inc_rel} (from {name})")
+
+                out.extend(flatten(inc_name, depth + 1))
+
+                # advance i: skip until we pass the '/' that terminates the include statement
+                k = j
+                while k < len(lines) and "/" not in lines[k]:
+                    k += 1
+                i = k + 1
                 continue
+
             out.append(lines[i])
             i += 1
         return out
 
-    return _flatten(deck_path, 0)
+    return flatten(entry)
 
 
-def load_eclipse_phi_k_from_uploads(
-    deck_upload,
-    include_uploads: list,
-    *,
-    kkey: str = "PERMX",
-    mode: str = "layer",
-    layer: int = 0
-) -> tuple[np.ndarray, np.ndarray, dict]:
+def _reshape_eclipse(arr, nx, ny, nz):
     """
-    Streamlit-friendly loader for TEXT decks.
-    - deck_upload: .DATA or .GRDECL etc (main deck)
-    - include_uploads: list of extra files user uploads (INC/GRDECL)
+    Eclipse grid ordering is typically (K,J,I) in file.
+    We reshape -> (nz, ny, nx) then transpose -> (nx, ny, nz) and pick k=0 by default.
     """
-    td = tempfile.TemporaryDirectory()
-    _TMPDIR_HOLD.append(td)
-    work = Path(td.name)
+    a = arr.reshape((nz, ny, nx))     # (K,J,I)
+    a = np.transpose(a, (2, 1, 0))    # (I,J,K)
+    return a
 
-    deck_path = _write_upload(work, deck_upload)
-    for f in include_uploads or []:
-        _write_upload(work, f)
 
-    file_index = _build_file_index(work)
+def load_eclipse_phi_k_from_uploads(zip_uploaded_file, layer=0, kkey="PERMX", mode="layer"):
+    """
+    Streamlit uploader -> zip bytes -> flatten deck -> read SPECGRID + PORO + PERMX.
+    Returns phi2d, k2d (float32) with inactive masked to NaN if ACTNUM present.
+    """
+    zip_bytes = zip_uploaded_file.getvalue()
+    lines = _flatten_deck_lines_from_zip(zip_bytes)
 
-    lines = flatten_deck_with_includes(deck_path, work, file_index)
-    nx, ny, nz = read_specgrid(lines)
+    nx, ny, nz = _read_specgrid_or_dimens(lines)
     n = nx * ny * nz
 
-    phi = read_keyword_array(lines, "PORO")
-    kx = read_keyword_array(lines, kkey.upper())
-    act = read_keyword_array(lines, "ACTNUM")
+    phi = _read_keyword_array(lines, "PORO")
+    kx = _read_keyword_array(lines, kkey)
+    act = _read_keyword_array(lines, "ACTNUM")  # optional
 
-    if phi is None:
-        raise RuntimeError("PORO not found. This deck may define properties via EQUALS/BOX/COPY; export explicit PORO first.")
-    if kx is None:
-        raise RuntimeError(f"{kkey.upper()} not found. Try PERMX/PERMX or export explicit permeability array.")
+    if phi is None or kx is None:
+        raise RuntimeError(f"Missing PORO or {kkey} in deck.")
 
     if phi.size != n:
-        raise RuntimeError(f"PORO has {phi.size} values, expected {n} (nx*ny*nz).")
+        raise RuntimeError(f"PORO has {phi.size}, expected {n} (nx*ny*nz).")
     if kx.size != n:
-        raise RuntimeError(f"{kkey.upper()} has {kx.size} values, expected {n} (nx*ny*nz).")
+        raise RuntimeError(f"{kkey} has {kx.size}, expected {n} (nx*ny*nz).")
 
+    phi3 = _reshape_eclipse(phi.astype(np.float32), nx, ny, nz)
+    k3 = _reshape_eclipse(kx.astype(np.float32), nx, ny, nz)
+
+    if mode == "layer":
+        kk = int(np.clip(layer, 0, nz - 1))
+        phi2 = phi3[:, :, kk].copy()
+        k2 = k3[:, :, kk].copy()
+    else:
+        phi2 = np.nanmean(phi3, axis=2).astype(np.float32)
+        k2 = np.nanmean(k3, axis=2).astype(np.float32)
+
+    # ACTNUM masking if present and correct length
     if act is not None and act.size == n:
-        mask = (act.reshape((n,)) > 0)
-        phi = np.where(mask, phi, np.nan).astype(np.float32)
-        kx = np.where(mask, kx, np.nan).astype(np.float32)
+        act3 = _reshape_eclipse(act.astype(np.float32), nx, ny, nz)
+        if mode == "layer":
+            act2 = act3[:, :, int(np.clip(layer, 0, nz - 1))]
+        else:
+            act2 = np.nanmean(act3, axis=2)
+        inactive = (act2 <= 0.0) | (~np.isfinite(phi2)) | (~np.isfinite(k2))
+        phi2[inactive] = np.nan
+        k2[inactive] = np.nan
 
-    phi2 = to_2d(phi, nx, ny, nz, mode=mode, layer=int(layer)).astype(np.float32)
-    k2 = to_2d(kx, nx, ny, nz, mode=mode, layer=int(layer)).astype(np.float32)
-
-    meta = {"nx": nx, "ny": ny, "nz": nz, "mode": mode, "layer": int(layer), "kkey": kkey.upper(), "deck": deck_path.name}
-    return phi2, k2, meta
+    return phi2.astype(np.float32), k2.astype(np.float32)
