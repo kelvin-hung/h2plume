@@ -1,12 +1,22 @@
+import os
+import sys
+from pathlib import Path
+
+# Ensure local imports work on Streamlit Cloud
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# Local modules (safe import)
 from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
-from eclipse_io import load_eclipse_phi_k_from_uploads
 from schedule_tools import build_cycle_schedule_ton_per_day, moving_average
+from eclipse_io import load_eclipse_phi_k_from_uploads
 
 st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
 st.title("VE + Darcy + Land: Forward plume prediction (ton/day cyclic scheduling)")
